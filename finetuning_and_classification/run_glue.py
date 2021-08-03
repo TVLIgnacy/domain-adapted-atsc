@@ -86,11 +86,7 @@ def train(args, train_dataset, model, tokenizer):
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
     if args.fp16:
-        try:
-            from apex import amp
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
-        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
+        scaler = torch.cuda.amp.GradScaler()
 
     # Train!
     logger.info("***** Running training *****")
@@ -116,8 +112,14 @@ def train(args, train_dataset, model, tokenizer):
                       'attention_mask': batch[1],
                       'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,  # XLM don't use segment_ids
                       'labels':         batch[3]}
-            ouputs = model(**inputs)
-            loss = ouputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
+
+            if args.fp16:
+                with torch.cuda.amp.autocast():
+                    ouputs = model(**inputs)
+                    loss = ouputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
+            else:
+                ouputs = model(**inputs)
+                loss = ouputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
 
             if args.n_gpu > 1:
                 loss = loss.mean() # mean() to average on multi-gpu parallel training
@@ -125,18 +127,23 @@ def train(args, train_dataset, model, tokenizer):
                 loss = loss / args.gradient_accumulation_steps
 
             if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+                scaler.scale(loss).backward()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm) # Not sure why this is here ...
+                
 
             tr_loss += loss.item()
             if (step + 1) % args.gradient_accumulation_steps == 0:
-                scheduler.step()  # Update learning rate schedule
-                optimizer.step()
-                model.zero_grad()
+                if args.fp16:
+                    scaler.step(optimizer)
+                    scale = scaler.get_scale()
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad()
+                if not args.fp16 or scale == scaler.get_scale():
+                    scheduler.step()
                 global_step += 1
 
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
@@ -223,6 +230,7 @@ def evaluate(args, model, tokenizer, prefix=""):
             preds = np.argmax(preds, axis=1)
         elif args.output_mode == "regression":
             preds = np.squeeze(preds)
+        print(eval_task, preds, out_label_ids)
         result = compute_metrics(eval_task, preds, out_label_ids)
         results.update(result)
 
@@ -492,7 +500,8 @@ def main():
             result = evaluate(args, model, tokenizer, prefix=global_step)
             result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
             results.update(result)
-
+    
+    print(results)
     return results
 
 

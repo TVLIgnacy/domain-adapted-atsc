@@ -17,13 +17,24 @@ from pytorch_transformers import WEIGHTS_NAME, CONFIG_NAME
 from pytorch_transformers.modeling_bert import BertForPreTraining
 from pytorch_transformers.tokenization_bert import BertTokenizer
 from pytorch_transformers.optimization import AdamW, WarmupLinearSchedule
-
+from torch import nn
 
 InputFeatures = namedtuple("InputFeatures", "input_ids input_mask segment_ids lm_label_ids is_next")
 
 log_format = '%(asctime)-10s: %(message)s'
 logging.basicConfig(level=logging.INFO, format=log_format)
 
+
+class BatchNormWrapper(nn.Module):
+    def __init__(self, m):
+        super(BatchNormWrapper, self).__init__()
+        self.m = m
+        self.m.eval()  # Set the batch norm to eval mode
+
+    def forward(self, x):
+        input_type = x.dtype
+        x = self.m(x.float())
+        return x.to(input_type)
 
 def convert_example_to_features(example, tokenizer, max_seq_length):
     tokens = example["tokens"]
@@ -36,16 +47,16 @@ def convert_example_to_features(example, tokenizer, max_seq_length):
     input_ids = tokenizer.convert_tokens_to_ids(tokens)
     masked_label_ids = tokenizer.convert_tokens_to_ids(masked_lm_labels)
 
-    input_array = np.zeros(max_seq_length, dtype=np.int)
+    input_array = np.zeros(max_seq_length, dtype=int)
     input_array[:len(input_ids)] = input_ids
 
-    mask_array = np.zeros(max_seq_length, dtype=np.bool)
+    mask_array = np.zeros(max_seq_length, dtype=bool)
     mask_array[:len(input_ids)] = 1
 
-    segment_array = np.zeros(max_seq_length, dtype=np.bool)
+    segment_array = np.zeros(max_seq_length, dtype=bool)
     segment_array[:len(segment_ids)] = segment_ids
 
-    lm_label_array = np.full(max_seq_length, dtype=np.int, fill_value=-1)
+    lm_label_array = np.full(max_seq_length, dtype=int, fill_value=-1)
     lm_label_array[masked_lm_positions] = masked_label_ids
 
     features = InputFeatures(input_ids=input_array,
@@ -86,10 +97,10 @@ class PregeneratedDataset(Dataset):
                                  shape=(num_samples,), mode='w+', dtype=np.bool)
         else:
             input_ids = np.zeros(shape=(num_samples, seq_len), dtype=np.int32)
-            input_masks = np.zeros(shape=(num_samples, seq_len), dtype=np.bool)
-            segment_ids = np.zeros(shape=(num_samples, seq_len), dtype=np.bool)
+            input_masks = np.zeros(shape=(num_samples, seq_len), dtype=bool)
+            segment_ids = np.zeros(shape=(num_samples, seq_len), dtype=bool)
             lm_label_ids = np.full(shape=(num_samples, seq_len), dtype=np.int32, fill_value=-1)
-            is_nexts = np.zeros(shape=(num_samples,), dtype=np.bool)
+            is_nexts = np.zeros(shape=(num_samples,), dtype=bool)
         logging.info(f"Loading training examples for epoch {epoch}")
         with data_file.open() as f:
             for i, line in enumerate(tqdm(f, total=num_samples, desc="Training examples")):
@@ -238,15 +249,10 @@ def main():
 
     # Prepare model
     model = BertForPreTraining.from_pretrained(args.bert_model)
-    if args.fp16:
-        model.half()
+
     model.to(device)
     if args.local_rank != -1:
-        try:
-            from apex.parallel import DistributedDataParallel as DDP
-        except ImportError:
-            raise ImportError(
-                "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
+        from torch.nn.parallel import DistributedDataParallel as DDP
         model = DDP(model)
     elif n_gpu > 1:
         model = torch.nn.DataParallel(model)
@@ -260,26 +266,11 @@ def main():
         {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
     ]
 
+    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     if args.fp16:
-        try:
-            from apex.optimizers import FP16_Optimizer
-            from apex.optimizers import FusedAdam
-        except ImportError:
-            raise ImportError(
-                "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
+        scaler = torch.cuda.amp.GradScaler()
 
-        optimizer = FusedAdam(optimizer_grouped_parameters,
-                              lr=args.learning_rate,
-                              bias_correction=False,
-                              max_grad_norm=1.0)
-        if args.loss_scale == 0:
-            optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
-        else:
-            optimizer = FP16_Optimizer(optimizer, static_loss_scale=args.loss_scale)
-    else:
-        optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=num_train_optimization_steps)
-
     global_step = 0
     logging.info("***** Running training *****")
     logging.info(f"  Num examples = {total_train_examples}")
@@ -308,14 +299,19 @@ def main():
             for step, batch in enumerate(train_dataloader):
                 batch = tuple(t.to(device) for t in batch)
                 input_ids, input_mask, segment_ids, lm_label_ids, is_next = batch
-                outputs = model(input_ids, segment_ids, input_mask, lm_label_ids, is_next)
-                loss = outputs[0]
+                if args.fp16:
+                    with torch.cuda.amp.autocast():
+                        outputs = model(input_ids, segment_ids, input_mask, lm_label_ids, is_next)
+                        loss = outputs[0]
+                else:
+                    outputs = model(input_ids, segment_ids, input_mask, lm_label_ids, is_next)
+                    loss = outputs[0]
                 if n_gpu > 1:
                     loss = loss.mean()  # mean() to average on multi-gpu.
                 if args.gradient_accumulation_steps > 1:
                     loss = loss / args.gradient_accumulation_steps
                 if args.fp16:
-                    optimizer.backward(loss)
+                    scaler.scale(loss).backward()
                 else:
                     loss.backward()
                 tr_loss += loss.item()
@@ -329,9 +325,15 @@ def main():
                 pbar.set_postfix_str(f"Loss: {mean_loss:.5f}")
 
                 if (step + 1) % args.gradient_accumulation_steps == 0:
-                    scheduler.step()  # Update learning rate schedule
-                    optimizer.step()
+                    if args.fp16:
+                        scaler.step(optimizer)
+                        scale = scaler.get_scale()
+                        scaler.update()
+                    else:
+                        optimizer.step()
                     optimizer.zero_grad()
+                    if not args.fp16 or scale == scaler.get_scale():
+                        scheduler.step()
                     global_step += 1
 
                 # write out a log with loss averaged over m steps
