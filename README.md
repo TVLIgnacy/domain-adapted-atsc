@@ -16,17 +16,11 @@ First clone repository, open a terminal and cd to the repository
     mkdir -p data/models
     
 
-For downstream finetuning, you also need to install torch, pytorch-transformers package and APEX (here for CUDA 10.0, which
-is compatible with torch 1.1.0 ). You can also perform downstream finetuning without APEX, but it has been used for the paper.
+For downstream finetuning, you also need to install torch  (1.6.0 or newer), pytorch-transformers package.
 
     pip install scipy sckit-learn  # pip install --default-timeout=100 scipy; if you get a timeout
-    pip install https://download.pytorch.org/whl/cu100/torch-1.1.0-cp36-cp36m-linux_x86_64.whl
-    pip install pytorch-transformers tensorboardX
+    pip install torch pytorch-transformers tensorboardX
 
-    cd ..
-    git clone https://github.com/NVIDIA/apex
-    cd apex
-    pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./
     
 ### Preparing data for BERT Language Model Finetuning
 

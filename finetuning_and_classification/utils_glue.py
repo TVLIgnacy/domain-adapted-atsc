@@ -176,7 +176,7 @@ def semeval2014term_to_aspectsentiment_hr(filename, remove_conflicting=True):
     def transform_aspect_term_name(se):
         return se
 
-    with open(filename) as file:
+    with open(filename, "r", encoding="utf-8") as file:
 
         sentence_elements = ET.parse(file).getroot().iter('sentence')
 

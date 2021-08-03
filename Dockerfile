@@ -12,5 +12,5 @@ RUN apt-get update && apt-get -y install python3-pip vim && pip install --upgrad
 
 RUN pip3 install -r requirements.txt
 
-RUN pip3 install torch pytorch-transformers
+RUN pip3 install torch pytorch-transformers tensorboardX scipy sklearn
 
